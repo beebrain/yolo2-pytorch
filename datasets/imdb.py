@@ -1,7 +1,9 @@
 import os
-import PIL
 import numpy as np
 from multiprocessing import Pool
+from functools import partial
+import cfgs.config as cfg
+import cv2
 
 
 def mkdir(path, max_depth=3):
@@ -14,7 +16,8 @@ def mkdir(path, max_depth=3):
 
 
 class ImageDataset(object):
-    def __init__(self, name, datadir, batch_size, im_processor, processes=3, shuffle=True, dst_size=None):
+    def __init__(self, name, datadir, batch_size, im_processor,
+                 processes=3, shuffle=True, dst_size=None):
         self._name = name
         self._data_dir = datadir
         self._batch_size = batch_size
@@ -38,29 +41,54 @@ class ImageDataset(object):
         self.gen = None
         self._im_processor = im_processor
 
-    def next_batch(self):
-        batch = {'images': [], 'gt_boxes': [], 'gt_classes': [], 'dontcare': [], 'origin_im': []}
+    def next_batch(self, size_index):
+        batch = {'images': [], 'gt_boxes': [], 'gt_classes': [],
+                 'dontcare': [], 'origin_im': []}
         i = 0
+        if self.gen is None:
+            indexes = np.arange(len(self.image_names), dtype=np.int)
+            if self._shuffle:
+                np.random.shuffle(indexes)
+            self.gen = self.pool.imap(partial(self._im_processor,
+                                              size_index=None),
+                                      ([self.image_names[i],
+                                        self.get_annotation(i),
+                                        self.dst_size] for i in indexes),
+                                      chunksize=self.batch_size)
+            self._epoch += 1
+            print(('epoch {} start...'.format(self._epoch)))
+
         while i < self.batch_size:
             try:
-                images, gt_boxes, classes, dontcare, origin_im = self.gen.next()
+                images, gt_boxes, classes, dontcare, origin_im = next(self.gen)
+
+                # multi-scale
+                w, h = cfg.multi_scale_inp_size[size_index]
+                gt_boxes = np.asarray(gt_boxes, dtype=np.float)
+                if len(gt_boxes) > 0:
+                    gt_boxes[:, 0::2] *= float(w) / images.shape[1]
+                    gt_boxes[:, 1::2] *= float(h) / images.shape[0]
+                images = cv2.resize(images, (w, h))
+
                 batch['images'].append(images)
                 batch['gt_boxes'].append(gt_boxes)
                 batch['gt_classes'].append(classes)
                 batch['dontcare'].append(dontcare)
                 batch['origin_im'].append(origin_im)
                 i += 1
-            except (StopIteration, AttributeError):
+            except (StopIteration,):
                 indexes = np.arange(len(self.image_names), dtype=np.int)
                 if self._shuffle:
                     np.random.shuffle(indexes)
-                self.gen = self.pool.imap(self._im_processor,
-                                          ([self.image_names[i], self.get_annotation(i), self.dst_size] for i in indexes),
+                self.gen = self.pool.imap(partial(self._im_processor,
+                                                  size_index=None),
+                                          ([self.image_names[i],
+                                            self.get_annotation(i),
+                                            self.dst_size] for i in indexes),
                                           chunksize=self.batch_size)
                 self._epoch += 1
-                print('epoch {} start...'.format(self._epoch))
+                print(('epoch {} start...'.format(self._epoch)))
         batch['images'] = np.asarray(batch['images'])
-
         return batch
 
     def close(self):
@@ -132,5 +160,3 @@ class ImageDataset(object):
     @property
     def batch_per_epoch(self):
         return self.num_images // self.batch_size
-
-
